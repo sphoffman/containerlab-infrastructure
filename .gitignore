@@ -1,0 +1,21 @@
+# Containerlab runtime/generated files
+**/clab-*/.tls/
+**/clab-*/.state.clab.yaml
+**/clab-*/topology-data.json
+**/clab-*/authorized_keys
+**/clab-*/ansible-inventory.yml
+**/clab-*/nornir-*-inventory.yml
+
+# Packet captures and local secrets
+**/pcaps/*
+!**/pcaps/.gitkeep
+.env
+.env.*
+*.secret
+secrets/
+
+# Python/editor/runtime files
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp

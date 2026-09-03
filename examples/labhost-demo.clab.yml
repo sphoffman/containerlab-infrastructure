@@ -1,0 +1,21 @@
+name: LabHost-Demo
+
+topology:
+  nodes:
+    host1:
+      kind: linux
+      image: ghcr.io/sphoffman/labhost:1.4
+      binds: [./configs:/config, ./pcaps:/pcaps]
+      cap-add: [NET_ADMIN, NET_RAW]
+      sysctls:
+        net.ipv4.tcp_l3mdev_accept: "1"
+    host2:
+      kind: linux
+      image: ghcr.io/sphoffman/labhost:1.4
+      binds: [./configs:/config, ./pcaps:/pcaps]
+      cap-add: [NET_ADMIN, NET_RAW]
+      sysctls:
+        net.ipv4.tcp_l3mdev_accept: "1"
+
+  links:
+    - endpoints: [host1:eth1, host2:eth1]

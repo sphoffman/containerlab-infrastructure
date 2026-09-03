@@ -1,0 +1,38 @@
+version: 1
+
+# Relative paths resolve from the repository root.
+labs_root: labs
+
+management:
+  supernet: 10.255.0.0/16
+  lab_prefix: 24
+  network_name_prefix: clab-mgmt-
+  gateway_address: 1
+  lab_ids:
+    first: 1
+    last: 254
+  node_addresses:
+    first: 10
+    last: 249
+  reserved_addresses:
+    - "1-9"
+    - "250-254"
+
+dns:
+  domain: lab.home.arpa
+  reverse_zone: 255.10.in-addr.arpa
+  ttl: 300
+  soa:
+    primary_ns: ns1.lab.home.arpa.
+    responsible: hostmaster.lab.home.arpa.
+    refresh: 3600
+    retry: 900
+    expire: 604800
+    negative_ttl: 300
+  nameserver:
+    name: ns1
+    # Documentation-only address. Replace before publishing DNS.
+    address: 192.0.2.53
+  bind:
+    forward_zone_file: /etc/bind/zones/db.lab.home.arpa
+    reverse_zone_file: /etc/bind/zones/db.10.255

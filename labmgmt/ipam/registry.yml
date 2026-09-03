@@ -1,0 +1,5 @@
+version: 1
+allocation:
+  next_lab_id: 1
+  recycled_lab_ids: []
+labs: {}

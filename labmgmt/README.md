@@ -246,6 +246,23 @@ This synchronizes IPAM and topology but does not publish DNS.
 
 DNS is generated entirely from active IPAM entries.
 
+### First-time BIND bootstrap
+
+A fresh BIND installation does not contain the two live files configured under `dns.bind`. Create and declare them before running the first `labmgmt onboard`, `labmgmt apply`, or `labmgmt dns` operation because LabMgmt reads their SOA serials when choosing the next serial.
+
+The complete copy-and-paste procedure is maintained in the repository's [Required first-time BIND setup](../README.md#required-first-time-bind-setup). It covers:
+
+* installing `bind9` and `bind9-utils`
+* creating `/etc/bind/zones`
+* creating valid initial forward and reverse zones
+* declaring both zones in `/etc/bind/named.conf.local`
+* setting ownership and permissions
+* running `named-checkzone` and `named-checkconf`
+* reloading and checking BIND
+* generating and installing the first LabMgmt-managed zones
+
+Do not merely create empty files. Each file must contain a valid SOA and NS record or both BIND validation and LabMgmt serial handling will fail.
+
 Generate and validate a preview:
 
 ```bash

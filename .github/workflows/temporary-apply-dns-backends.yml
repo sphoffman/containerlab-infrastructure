@@ -1,0 +1,83 @@
+name: Temporary DNS backend patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/temporary-apply-dns-backends.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply patch
+        run: python3 .github/scripts/temporary_patch_dns_backends.py
+
+      - name: Syntax check
+        run: python3 -m py_compile scripts/labmgmt
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --disable-pip-version-check pyyaml ruamel.yaml
+
+      - name: Validate default BIND configuration
+        run: python3 scripts/labmgmt validate
+
+      - name: Check backend compatibility helpers
+        run: |
+          python3 - <<'PY'
+          import runpy
+          ns = runpy.run_path('scripts/labmgmt')
+          load_yaml = ns['load_yaml']
+          config = load_yaml(ns['CONFIG_FILE'])
+          get_backend = ns['get_dns_backend_config']
+          get_paths = ns['get_live_dns_zone_paths']
+
+          backend, _ = get_backend(config)
+          assert backend == 'bind', backend
+
+          old_style = dict(config)
+          old_style['dns'] = dict(config['dns'])
+          old_style['dns'].pop('backend', None)
+          old_style['dns'].pop('tiny_dns', None)
+          backend, _ = get_backend(old_style)
+          assert backend == 'bind', backend
+
+          tiny = dict(config)
+          tiny['dns'] = dict(config['dns'])
+          tiny['dns']['backend'] = 'tiny-dns'
+          backend, settings = get_backend(tiny)
+          assert backend == 'tiny-dns', backend
+          forward, reverse = get_paths(tiny)
+          assert str(forward) == '/etc/tiny-dns/zones/lab.home.arpa.zone'
+          assert str(reverse) == '/etc/tiny-dns/zones/255.10.in-addr.arpa.zone'
+
+          read_serial = ns['read_zone_serial']
+          from pathlib import Path
+          import tempfile
+          with tempfile.TemporaryDirectory() as td:
+              p = Path(td) / 'zone'
+              p.write_text('@ IN SOA ns1 admin 2026092702 3600 900 604800 60\n')
+              assert read_serial(p) == 2026092702
+              p.write_text('@ IN SOA ns1. admin. (\n  2026092703\n  3600 900 604800 60\n)\n')
+              assert read_serial(p) == 2026092703
+          PY
+
+      - name: Remove temporary patch machinery
+        run: |
+          git rm .github/scripts/temporary_patch_dns_backends.py
+          git rm .github/workflows/temporary-apply-dns-backends.yml
+
+      - name: Commit changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/labmgmt labmgmt/config.yml README.md labmgmt/README.md
+          git commit -m 'feat: support bind and tiny-dns backends'
+          git push origin HEAD:main

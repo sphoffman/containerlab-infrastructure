@@ -299,7 +299,7 @@ labmgmt/generated/dns/db.10.255
 
 The staging files are validated with `named-checkzone`.
 
-Publish them to BIND:
+Publish them to the selected DNS backend:
 
 ```bash
 sudo labmgmt dns install

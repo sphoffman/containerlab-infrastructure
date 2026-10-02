@@ -244,7 +244,16 @@ This synchronizes IPAM and topology but does not publish DNS.
 
 ## DNS
 
-DNS is generated entirely from active IPAM entries.
+DNS is generated entirely from active IPAM entries. The serving backend is selected with `dns.backend`. BIND is the default, including when `dns.backend` is omitted for backward compatibility. The alternative `tiny-dns` backend uses the same generated master-file records but publishes them to a systemd-managed tiny-dns service.
+
+The Git-managed staging files remain backend-neutral:
+
+```text
+labmgmt/generated/dns/db.lab.home.arpa
+labmgmt/generated/dns/db.10.255
+```
+
+Both backends require `named-checkzone`; only the BIND backend also requires `named-checkconf` and `rndc`.
 
 ### First-time BIND bootstrap
 
@@ -261,7 +270,13 @@ The complete copy-and-paste procedure is maintained in the repository's [Require
 * reloading and checking BIND
 * generating and installing the first LabMgmt-managed zones
 
-Do not merely create empty files. Each file must contain a valid SOA and NS record or both BIND validation and LabMgmt serial handling will fail.
+Do not merely create empty files. Each file must contain a valid SOA and NS record or both zone validation and LabMgmt serial handling will fail.
+
+### First-time tiny-dns bootstrap
+
+Set `dns.backend: tiny-dns` and configure `dns.tiny_dns.forward_zone_file`, `dns.tiny_dns.reverse_zone_file`, and `dns.tiny_dns.service`. The complete copy-and-paste procedure is maintained in the repository's [Alternative tiny-dns setup](../README.md#alternative-tiny-dns-setup).
+
+For the default `10.255.0.0/16` management supernet, the reverse DNS zone is `255.10.in-addr.arpa`. LabMgmt prepends an explicit `$ORIGIN` when publishing to tiny-dns so standalone master-file readers do not have to infer the origin from a separate server configuration. LabMgmt also accepts either parenthesized or single-line SOA records when reading the current live serial.
 
 Generate and validate a preview:
 
@@ -293,28 +308,31 @@ sudo labmgmt dns install
 The install process:
 
 1. Validates IPAM and DNS configuration.
-2. Confirms the staging files match current IPAM.
-3. Runs `named-checkzone`.
-4. Runs `named-checkconf`.
-5. Backs up the current live BIND zone files.
-6. Atomically installs both zones.
-7. Validates the installed configuration and zones.
-8. Runs `rndc reload` only after validation succeeds.
-9. Checks BIND status.
-10. Restores the previous files if installation fails.
+2. Confirms the staging files match current IPAM and the live SOA serials.
+3. Runs `named-checkzone` against both zones.
+4. Validates the selected backend (`named-checkconf` for BIND, systemd service definition for tiny-dns).
+5. Backs up the current live zone files.
+6. Atomically installs both zones while preserving the live files' owner, group, and mode.
+7. Validates the installed backend configuration/service and both live zones.
+8. Reloads BIND with `rndc reload` or restarts the configured tiny-dns service.
+9. Checks backend status.
+10. Restores the previous files and reloads/restarts the backend if installation fails.
 
-Live zone files are:
+For the default BIND backend, live zone files are:
 
 ```text
 /etc/bind/zones/db.lab.home.arpa
 /etc/bind/zones/db.10.255
 ```
 
-BIND backups are kept beneath:
+For the example tiny-dns backend, live zone files are:
 
 ```text
-/etc/bind/zones/labmgmt-backups/
+/etc/tiny-dns/zones/lab.home.arpa.zone
+/etc/tiny-dns/zones/255.10.in-addr.arpa.zone
 ```
+
+Backups are kept beneath `labmgmt-backups/` in the common parent directory of the selected backend's two live zone files.
 
 DNS serials use a `YYYYMMDDNN` format and are always increased relative to the current live zone serials.
 
@@ -487,8 +505,8 @@ The Git helper scripts in `/path/to/containerlab-infrastructure/scripts` can the
 * Never silently guess that a renamed node is the same device.
 * Never silently return an allocated Lab ID after a partial failure.
 * DNS is generated from IPAM rather than edited record-by-record.
-* BIND is never reloaded unless generated zones validate.
-* Live BIND files are backed up before replacement.
+* The selected DNS backend is never reloaded/restarted unless generated zones validate.
+* Live DNS files are backed up before replacement.
 * Topology and IPAM writes use atomic replacement and rollback where appropriate.
 
 ## Recommended Routine

@@ -19,6 +19,9 @@ management:
     - "250-254"
 
 dns:
+  # DNS publishing backend. Supported values: bind, tiny-dns.
+  # 'bind' remains the default when this setting is omitted.
+  backend: bind
   domain: lab.home.arpa
   reverse_zone: 255.10.in-addr.arpa
   ttl: 300
@@ -36,3 +39,7 @@ dns:
   bind:
     forward_zone_file: /etc/bind/zones/db.lab.home.arpa
     reverse_zone_file: /etc/bind/zones/db.10.255
+  tiny_dns:
+    forward_zone_file: /etc/tiny-dns/zones/lab.home.arpa.zone
+    reverse_zone_file: /etc/tiny-dns/zones/255.10.in-addr.arpa.zone
+    service: tiny-dns.service

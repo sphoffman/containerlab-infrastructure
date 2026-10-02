@@ -1830,12 +1830,150 @@ def run_command_checked(command, description):
     )
 
 
+def get_dns_backend_config(config):
+    dns = config["dns"]
+    backend = str(
+        dns.get("backend", "bind")
+    ).strip().lower()
+
+    if backend == "bind":
+        key = "bind"
+    elif backend == "tiny-dns":
+        key = "tiny_dns"
+    else:
+        raise LabMgmtError(
+            f"Unsupported DNS backend: {backend}. "
+            "Supported backends are 'bind' and 'tiny-dns'."
+        )
+
+    try:
+        backend_config = dns[key]
+    except (KeyError, TypeError):
+        raise LabMgmtError(
+            f"DNS backend '{backend}' requires dns.{key} configuration"
+        )
+
+    if not isinstance(backend_config, dict):
+        raise LabMgmtError(
+            f"dns.{key} must be a mapping"
+        )
+
+    return backend, backend_config
+
+
+def get_live_dns_zone_paths(config):
+    _, backend_config = get_dns_backend_config(config)
+
+    try:
+        forward_live = Path(
+            backend_config["forward_zone_file"]
+        )
+        reverse_live = Path(
+            backend_config["reverse_zone_file"]
+        )
+    except (KeyError, TypeError) as exc:
+        raise LabMgmtError(
+            f"Invalid DNS backend configuration: {exc}"
+        )
+
+    return forward_live, reverse_live
+
+
+def dns_backend_display_name(config):
+    backend, _ = get_dns_backend_config(config)
+    return "BIND" if backend == "bind" else "tiny-dns"
+
+
+def prepare_live_zone_text(config, zone_name, zone_text):
+    backend, _ = get_dns_backend_config(config)
+
+    if backend != "tiny-dns":
+        return zone_text
+
+    origin = zone_name.rstrip(".") + "."
+
+    if re.search(
+        r"(?im)^\s*\$ORIGIN\s+",
+        zone_text,
+    ):
+        return zone_text
+
+    return f"$ORIGIN {origin}\n{zone_text}"
+
+
+def validate_dns_server_configuration(config, description=None):
+    backend, backend_config = get_dns_backend_config(config)
+
+    if backend == "bind":
+        return run_command_checked(
+            ["named-checkconf"],
+            description or "BIND configuration validation",
+        )
+
+    service = str(
+        backend_config["service"]
+    ).strip()
+
+    return run_command_checked(
+        ["systemctl", "cat", service],
+        description or "tiny-dns service validation",
+    )
+
+
+def reload_dns_server(config, rollback=False):
+    backend, backend_config = get_dns_backend_config(config)
+
+    if backend == "bind":
+        return (
+            "BIND reload",
+            run_command_checked(
+                ["rndc", "reload"],
+                "Rollback BIND reload"
+                if rollback
+                else "BIND reload",
+            ),
+        )
+
+    service = str(
+        backend_config["service"]
+    ).strip()
+
+    return (
+        "tiny-dns restart",
+        run_command_checked(
+            ["systemctl", "restart", service],
+            "Rollback tiny-dns restart"
+            if rollback
+            else "tiny-dns restart",
+        ),
+    )
+
+
+def check_dns_server_status(config):
+    backend, backend_config = get_dns_backend_config(config)
+
+    if backend == "bind":
+        return run_command_checked(
+            ["rndc", "status"],
+            "BIND status check",
+        )
+
+    service = str(
+        backend_config["service"]
+    ).strip()
+
+    return run_command_checked(
+        ["systemctl", "is-active", service],
+        "tiny-dns status check",
+    )
+
+
 def replace_live_file_atomic(path, content):
     path = Path(path)
 
     if not path.exists():
         raise LabMgmtError(
-            f"Live BIND file does not exist: {path}"
+            f"Live DNS file does not exist: {path}"
         )
 
     stat_info = path.stat()
@@ -1850,10 +1988,8 @@ def replace_live_file_atomic(path, content):
             f.flush()
             os.fsync(f.fileno())
 
-        #
         # Preserve the original file's permissions,
         # owner and group.
-        #
         os.chmod(
             temp_path,
             stat_info.st_mode & 0o7777,
@@ -1882,15 +2018,12 @@ def replace_live_file_atomic(path, content):
             f"Unable to install {path}: {exc}"
         )
 
-
 def install_dns_zones(
     config,
     registry,
 ):
-    #
-    # This operation must run as root because it
-    # modifies /etc/bind and invokes rndc.
-    #
+    # Publishing DNS requires root because the live zone files and
+    # backend reload/restart operations are system-managed resources.
     if os.geteuid() != 0:
         raise LabMgmtError(
             "DNS installation requires root privileges. "
@@ -1898,21 +2031,16 @@ def install_dns_zones(
         )
 
     dns = config["dns"]
+    backend, _ = get_dns_backend_config(config)
+    backend_name = dns_backend_display_name(config)
 
     forward_zone = dns["domain"]
     reverse_zone = dns["reverse_zone"]
 
-    forward_live = Path(
-        dns["bind"]["forward_zone_file"]
+    forward_live, reverse_live = get_live_dns_zone_paths(
+        config
     )
 
-    reverse_live = Path(
-        dns["bind"]["reverse_zone_file"]
-    )
-
-    #
-    # Staging files must already exist.
-    #
     if not GENERATED_FORWARD_ZONE.exists():
         raise LabMgmtError(
             f"Generated forward zone is missing: "
@@ -1927,12 +2055,8 @@ def install_dns_zones(
             "Run 'labmgmt dns' first."
         )
 
-    #
-    # Calculate what DNS should look like RIGHT NOW.
-    #
-    # This makes sure IPAM hasn't changed since
-    # the staging files were generated.
-    #
+    # Calculate what DNS should look like RIGHT NOW so IPAM cannot
+    # change between staging and installation unnoticed.
     serials = calculate_next_dns_serial(
         config
     )
@@ -1954,16 +2078,11 @@ def install_dns_zones(
         records,
     )
 
-    staged_forward = (
-        GENERATED_FORWARD_ZONE.read_text(
-            encoding="utf-8"
-        )
+    staged_forward = GENERATED_FORWARD_ZONE.read_text(
+        encoding="utf-8"
     )
-
-    staged_reverse = (
-        GENERATED_REVERSE_ZONE.read_text(
-            encoding="utf-8"
-        )
+    staged_reverse = GENERATED_REVERSE_ZONE.read_text(
+        encoding="utf-8"
     )
 
     if staged_forward != expected_forward:
@@ -1980,72 +2099,54 @@ def install_dns_zones(
             "Run 'labmgmt dns' as your normal user first."
         )
 
+    live_forward_text = prepare_live_zone_text(
+        config,
+        forward_zone,
+        staged_forward,
+    )
+    live_reverse_text = prepare_live_zone_text(
+        config,
+        reverse_zone,
+        staged_reverse,
+    )
+
     print()
     print("DNS INSTALL")
     print("===========")
+    print(f"Backend: {backend_name}")
 
     print()
     print("Pre-install validation")
     print("----------------------")
 
-    #
-    # Validate staging files.
-    #
-    validate_zone_file(
+    validate_zone_text(
         forward_zone,
-        GENERATED_FORWARD_ZONE,
+        live_forward_text,
     )
-
     print("Generated forward zone: OK")
 
-    validate_zone_file(
+    validate_zone_text(
         reverse_zone,
-        GENERATED_REVERSE_ZONE,
+        live_reverse_text,
     )
-
     print("Generated reverse zone: OK")
 
-    #
-    # Validate current BIND configuration before
-    # modifying anything.
-    #
-    run_command_checked(
-        ["named-checkconf"],
-        "BIND configuration validation",
-    )
+    validate_dns_server_configuration(config)
+    print(f"{backend_name} configuration/service: OK")
 
-    print("BIND configuration:      OK")
-
-    #
-    # Ensure the live files actually exist before
-    # attempting a transactional replacement.
-    #
     if not forward_live.exists():
         raise LabMgmtError(
-            f"Live forward zone does not exist: "
-            f"{forward_live}"
+            f"Live forward zone does not exist: {forward_live}"
         )
 
     if not reverse_live.exists():
         raise LabMgmtError(
-            f"Live reverse zone does not exist: "
-            f"{reverse_live}"
+            f"Live reverse zone does not exist: {reverse_live}"
         )
 
-    #
-    # Save exact originals in memory for rollback.
-    #
-    original_forward = (
-        forward_live.read_bytes()
-    )
+    original_forward = forward_live.read_bytes()
+    original_reverse = reverse_live.read_bytes()
 
-    original_reverse = (
-        reverse_live.read_bytes()
-    )
-
-    #
-    # Also create persistent backups.
-    #
     timestamp = (
         datetime.datetime.now()
         .strftime("%Y%m%d-%H%M%S")
@@ -2070,76 +2171,48 @@ def install_dns_zones(
         parents=True,
         exist_ok=False,
     )
+    os.chmod(backup_dir, 0o750)
 
-    os.chmod(
-        backup_dir,
-        0o750,
-    )
+    forward_backup = backup_dir / forward_live.name
+    reverse_backup = backup_dir / reverse_live.name
 
-    forward_backup = (
-        backup_dir / forward_live.name
-    )
-
-    reverse_backup = (
-        backup_dir / reverse_live.name
-    )
-
-    shutil.copy2(
-        forward_live,
-        forward_backup,
-    )
-
-    shutil.copy2(
-        reverse_live,
-        reverse_backup,
-    )
+    shutil.copy2(forward_live, forward_backup)
+    shutil.copy2(reverse_live, reverse_backup)
 
     print()
     print("Backup")
     print("------")
-
-    print(
-        f"Created: {backup_dir}"
-    )
+    print(f"Created: {backup_dir}")
 
     wrote_forward = False
     wrote_reverse = False
 
     try:
-        #
-        # Install both files atomically.
-        #
         replace_live_file_atomic(
             forward_live,
-            staged_forward.encode("utf-8"),
+            live_forward_text.encode("utf-8"),
         )
-
         wrote_forward = True
 
         replace_live_file_atomic(
             reverse_live,
-            staged_reverse.encode("utf-8"),
+            live_reverse_text.encode("utf-8"),
         )
-
         wrote_reverse = True
 
-        #
-        # Validate the complete BIND configuration
-        # after installation.
-        #
-        run_command_checked(
-            ["named-checkconf"],
-            "Post-install BIND configuration validation",
+        validate_dns_server_configuration(
+            config,
+            description=(
+                "Post-install BIND configuration validation"
+                if backend == "bind"
+                else "Post-install tiny-dns service validation"
+            ),
         )
 
-        #
-        # Validate the LIVE zone files.
-        #
         validate_zone_file(
             forward_zone,
             forward_live,
         )
-
         validate_zone_file(
             reverse_zone,
             reverse_live,
@@ -2148,35 +2221,29 @@ def install_dns_zones(
         print()
         print("Post-install validation")
         print("-----------------------")
-
-        print("BIND configuration: OK")
+        print(f"{backend_name} configuration/service: OK")
         print("Live forward zone:  OK")
         print("Live reverse zone:  OK")
 
-        #
-        # Only reload after ALL validation succeeds.
-        #
-        reload_output = run_command_checked(
-            ["rndc", "reload"],
-            "BIND reload",
+        action_name, reload_output = reload_dns_server(
+            config
         )
 
         print()
-        print("BIND reload")
-        print("-----------")
+        print(action_name)
+        print("-" * len(action_name))
 
         if reload_output:
             print(reload_output)
         else:
-            print("rndc reload: OK")
+            print(f"{action_name}: OK")
 
-        #
-        # Confirm that named is responding to rndc.
-        #
-        run_command_checked(
-            ["rndc", "status"],
-            "BIND status check",
+        status_output = check_dns_server_status(
+            config
         )
+
+        if status_output and backend == "tiny-dns":
+            print(f"tiny-dns status: {status_output}")
 
     except Exception as exc:
         print()
@@ -2195,8 +2262,7 @@ def install_dns_zones(
                 )
             except Exception as rollback_exc:
                 rollback_errors.append(
-                    f"forward rollback: "
-                    f"{rollback_exc}"
+                    f"forward rollback: {rollback_exc}"
                 )
 
         if wrote_reverse:
@@ -2207,39 +2273,34 @@ def install_dns_zones(
                 )
             except Exception as rollback_exc:
                 rollback_errors.append(
-                    f"reverse rollback: "
-                    f"{rollback_exc}"
+                    f"reverse rollback: {rollback_exc}"
                 )
 
-        #
-        # Attempt to reload the restored zones.
-        #
         if not rollback_errors:
             try:
-                run_command_checked(
-                    ["named-checkconf"],
-                    "Rollback configuration validation",
+                validate_dns_server_configuration(
+                    config,
+                    description="Rollback DNS backend validation",
                 )
 
                 validate_zone_file(
                     forward_zone,
                     forward_live,
                 )
-
                 validate_zone_file(
                     reverse_zone,
                     reverse_live,
                 )
 
-                run_command_checked(
-                    ["rndc", "reload"],
-                    "Rollback BIND reload",
+                reload_dns_server(
+                    config,
+                    rollback=True,
                 )
+                check_dns_server_status(config)
 
             except Exception as rollback_exc:
                 rollback_errors.append(
-                    f"rollback reload: "
-                    f"{rollback_exc}"
+                    f"rollback reload: {rollback_exc}"
                 )
 
         if rollback_errors:
@@ -2259,18 +2320,11 @@ def install_dns_zones(
 
     print()
     print("DNS installation successful.")
-    print(
-        f"Serial:          {serials['new']}"
-    )
-    print(
-        f"Forward zone:    {forward_live}"
-    )
-    print(
-        f"Reverse zone:    {reverse_live}"
-    )
-    print(
-        f"Backup:          {backup_dir}"
-    )
+    print(f"Backend:         {backend_name}")
+    print(f"Serial:          {serials['new']}")
+    print(f"Forward zone:    {forward_live}")
+    print(f"Reverse zone:    {reverse_live}")
+    print(f"Backup:          {backup_dir}")
 
 def validate_dns_config(config):
     try:
@@ -2281,15 +2335,12 @@ def validate_dns_config(config):
         ttl = int(dns["ttl"])
 
         soa = dns["soa"]
-
         primary_ns = str(
             soa["primary_ns"]
         ).strip()
-
         responsible = str(
             soa["responsible"]
         ).strip()
-
         refresh = int(soa["refresh"])
         retry = int(soa["retry"])
         expire = int(soa["expire"])
@@ -2298,24 +2349,30 @@ def validate_dns_config(config):
         )
 
         nameserver = dns["nameserver"]
-
         ns_name = str(
             nameserver["name"]
         ).strip()
-
         ns_address = ipaddress.ip_address(
             str(nameserver["address"])
         )
 
-        bind = dns["bind"]
+        backend, backend_config = get_dns_backend_config(
+            config
+        )
 
         forward_file = Path(
-            bind["forward_zone_file"]
+            backend_config["forward_zone_file"]
+        )
+        reverse_file = Path(
+            backend_config["reverse_zone_file"]
         )
 
-        reverse_file = Path(
-            bind["reverse_zone_file"]
-        )
+        if backend == "tiny-dns":
+            service = str(
+                backend_config["service"]
+            ).strip()
+        else:
+            service = None
 
     except (
         KeyError,
@@ -2375,10 +2432,7 @@ def validate_dns_config(config):
         (refresh, "refresh"),
         (retry, "retry"),
         (expire, "expire"),
-        (
-            negative_ttl,
-            "negative_ttl",
-        ),
+        (negative_ttl, "negative_ttl"),
     ):
         if value <= 0:
             raise LabMgmtError(
@@ -2396,6 +2450,10 @@ def validate_dns_config(config):
             "Reverse zone path must be absolute"
         )
 
+    if backend == "tiny-dns" and not service:
+        raise LabMgmtError(
+            "dns.tiny_dns.service cannot be empty"
+        )
 
 def read_zone_serial(path):
     path = Path(path)
@@ -2419,10 +2477,13 @@ def read_zone_serial(path):
             f"{path}: {exc}"
         )
 
+    # Accept both common master-file SOA forms:
+    #   SOA ns hostmaster (\n 2026010101 ... )
+    #   SOA ns hostmaster 2026010101 3600 900 ...
     match = re.search(
-        r"\bSOA\b.*?\(\s*(\d+)",
+        r"\bSOA\b\s+\S+\s+\S+\s+\(?\s*(\d+)\b",
         text,
-        flags=re.DOTALL | re.IGNORECASE,
+        flags=re.IGNORECASE,
     )
 
     if not match:
@@ -2432,28 +2493,19 @@ def read_zone_serial(path):
 
     return int(match.group(1))
 
-
 def calculate_next_dns_serial(config):
-    bind = config["dns"]["bind"]
-
-    forward_file = Path(
-        bind["forward_zone_file"]
-    )
-
-    reverse_file = Path(
-        bind["reverse_zone_file"]
+    forward_file, reverse_file = get_live_dns_zone_paths(
+        config
     )
 
     forward_serial = read_zone_serial(
         forward_file
     )
-
     reverse_serial = read_zone_serial(
         reverse_file
     )
 
     today = datetime.date.today()
-
     today_base = int(
         today.strftime("%Y%m%d") + "00"
     )
@@ -2473,7 +2525,6 @@ def calculate_next_dns_serial(config):
         "reverse": reverse_serial,
         "new": new_serial,
     }
-
 
 def reverse_owner_for_ip(
     address,
@@ -3249,7 +3300,7 @@ def command_register(args):
     print(f"Created:  {destination}")
     print(f"Updated:  {REGISTRY_FILE}")
     print()
-    print("Topology and BIND were NOT modified.")
+    print("Topology and DNS were NOT modified.")
 
 def load_roundtrip_yaml(path):
     yaml_rt = YAML()
@@ -3945,7 +3996,7 @@ def command_sync(args):
         f"{total_topology_changes}"
     )
     print("DNS changes:        not evaluated yet")
-    print("BIND reload:        no")
+    print("DNS server reload/restart: no")
 
     #
     # Dry-run ends here.
@@ -4079,7 +4130,7 @@ def command_sync(args):
         )
 
     print()
-    print("DNS and BIND were NOT modified.")
+    print("DNS server was NOT modified.")
 
 def write_text_atomic(path, content):
     path.parent.mkdir(
@@ -4382,7 +4433,7 @@ def command_dns(args):
 
     print()
     print(
-        "BIND live zone files were NOT modified."
+        "Live DNS zone files were NOT modified."
     )
 
     print(
